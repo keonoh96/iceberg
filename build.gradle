@@ -1340,6 +1340,7 @@ project(':iceberg-exp') {
     implementation(libs.parquet.hadoop)
     implementation libs.caffeine
     implementation libs.duckdb
+    implementation 'org.postgresql:postgresql:42.7.3'
     implementation platform(libs.jackson.bom)
     implementation libs.jackson.core
     implementation libs.jackson.databind
