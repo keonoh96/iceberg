@@ -83,21 +83,32 @@ public class MultiTableTxn4 {
     private MultiTableTxn4() {}
 
     /**
-     * Thread-safe Zipfian generator for picking tables at random according to skew.
+     * Thread-safe table generator supporting Zipfian skew (skew > 0) or uniform distribution (skew == 0).
      */
     public static class ZipfGenerator {
         private final ThreadLocal<ZipfDistribution> threadLocalZipf;
+        private final int numTables;
+        private final boolean isUniform;
 
         public ZipfGenerator(int numTables, double skew) {
-            if (numTables <= 0 || skew <= 0.0) {
-                throw new IllegalArgumentException("numTables and skew must be > 0");
+            if (numTables <= 0 || skew < 0.0) {
+                throw new IllegalArgumentException("numTables must be > 0 and skew must be >= 0");
             }
-            this.threadLocalZipf = ThreadLocal.withInitial(
-                    () -> new ZipfDistribution(numTables, skew)
-            );
+            this.numTables = numTables;
+            this.isUniform = (skew == 0.0);
+            if (!isUniform) {
+                this.threadLocalZipf = ThreadLocal.withInitial(
+                        () -> new ZipfDistribution(numTables, skew)
+                );
+            } else {
+                this.threadLocalZipf = null;
+            }
         }
 
         public int getNext() {
+            if (isUniform) {
+                return ThreadLocalRandom.current().nextInt(1, numTables + 1);
+            }
             return threadLocalZipf.get().sample();
         }
     }
@@ -188,6 +199,11 @@ public class MultiTableTxn4 {
             summaryNode.put("num_success", numSuccess);
             summaryNode.put("num_failure", numFailure);
             summaryNode.put("avg_latency", avgLatency);
+            if (!isDuckLake) {
+                summaryNode.put("num_retries", numRetries);
+                summaryNode.put("start_backoff_ms", startBackoffMs);
+                summaryNode.put("backoff_multiplier", backoffMultiplier);
+            }
 
             try (BufferedWriter writer = Files.newBufferedWriter(
                     Paths.get(outputFile),
@@ -248,7 +264,11 @@ public class MultiTableTxn4 {
     private static String pgPassword;
     private static String pgDbName;
     private static String ducklakeDataPath;
-    private static String ducklakeExtensionPath;
+
+    // Raven retry and backoff parameters
+    private static int numRetries = 10;
+    private static long startBackoffMs = 100L;
+    private static double backoffMultiplier = 1.5;
 
     // Catalogs and connections
     private static final List<RavenCatalog> RAVEN_CATALOGS = Lists.newArrayList();
@@ -322,9 +342,32 @@ public class MultiTableTxn4 {
             pgPassword = expConfigs.getOrDefault("pg_password", expConfigs.getOrDefault("db_password", ""));
             pgDbName = expConfigs.getOrDefault("pg_db_name", expConfigs.getOrDefault("pg_dbname", expConfigs.getOrDefault("db_name", "ducklakedb")));
             ducklakeDataPath = expConfigs.getOrDefault("ducklake_data_path", warehouseLocation);
-            ducklakeExtensionPath = expConfigs.get("ducklake_extension_path");
         } else {
             ravenAddress = expConfigs.get("raven_address");
+            if (expConfigs.containsKey("num_retries")) {
+                numRetries = Integer.parseInt(expConfigs.get("num_retries"));
+            } else if (expConfigs.containsKey("max_retries")) {
+                numRetries = Integer.parseInt(expConfigs.get("max_retries"));
+            } else if (expConfigs.containsKey("retry_count")) {
+                numRetries = Integer.parseInt(expConfigs.get("retry_count"));
+            }
+
+            if (expConfigs.containsKey("start_backoff_ms")) {
+                startBackoffMs = Long.parseLong(expConfigs.get("start_backoff_ms"));
+            } else if (expConfigs.containsKey("backoff_start_ms")) {
+                startBackoffMs = Long.parseLong(expConfigs.get("backoff_start_ms"));
+            } else if (expConfigs.containsKey("retry_wait_ms")) {
+                startBackoffMs = Long.parseLong(expConfigs.get("retry_wait_ms"));
+            }
+
+            if (expConfigs.containsKey("backoff_multiplier")) {
+                backoffMultiplier = Double.parseDouble(expConfigs.get("backoff_multiplier"));
+            } else if (expConfigs.containsKey("retry_multiplier")) {
+                backoffMultiplier = Double.parseDouble(expConfigs.get("retry_multiplier"));
+            } else if (expConfigs.containsKey("retry_backoff")) {
+                backoffMultiplier = Double.parseDouble(expConfigs.get("retry_backoff"));
+            }
+
             initRavenCatalog();
             int numRaven = Math.min(numThreads, 6);
             for (int i = 0; i < numRaven; i++) {
@@ -356,91 +399,85 @@ public class MultiTableTxn4 {
         runExp(expConfigs);
     }
 
+    private static void executeSql(DuckDBConnection conn, String sql) throws SQLException {
+        try (Statement stmt = conn.createStatement()) {
+            stmt.execute(sql);
+        }
+    }
+
     /**
      * Creates and sets up a per-thread DuckDB connection.
      * Loads httpfs, parquet, and S3 credentials. If is_duck_lake is true, also loads
-     * PostgreSQL scanner, DuckLake, disables data inlining (ducklake_default_data_inlining_row_limit = 0),
+     * PostgreSQL scanner, DuckLake, disables data inlining (DATA_INLINING_ROW_LIMIT 0),
      * and attaches the DuckLake catalog.
      */
     private static DuckDBConnection createDuckDBConnection() throws SQLException {
         DuckDBConnection conn = (DuckDBConnection) DriverManager.getConnection("jdbc:duckdb:");
-        try (Statement stmt = conn.createStatement()) {
-            stmt.execute("INSTALL httpfs; LOAD httpfs;");
-            stmt.execute("INSTALL parquet; LOAD parquet;");
+        executeSql(conn, "INSTALL httpfs; LOAD httpfs;");
+        executeSql(conn, "INSTALL parquet; LOAD parquet;");
 
-            // Configure S3 secret for S3 storage access
-            String secretSql;
-            if (s3Endpoint != null && !s3Endpoint.isEmpty()) {
-                secretSql = String.format(
-                        Locale.getDefault(),
-                        "CREATE SECRET IF NOT EXISTS s3_secret (TYPE S3, KEY_ID '%s', SECRET '%s', REGION '%s', ENDPOINT '%s', USE_SSL false);",
-                        s3KeyId,
-                        s3Secret,
-                        s3Region,
-                        s3Endpoint);
-            } else {
-                secretSql = String.format(
-                        Locale.getDefault(),
-                        "CREATE SECRET IF NOT EXISTS s3_secret (TYPE S3, KEY_ID '%s', SECRET '%s', REGION '%s');",
-                        s3KeyId,
-                        s3Secret,
-                        s3Region);
+        // Configure S3 secret for S3 storage access
+        String secretSql;
+        if (s3Endpoint != null && !s3Endpoint.isEmpty()) {
+            secretSql = String.format(
+                    Locale.getDefault(),
+                    "CREATE SECRET IF NOT EXISTS s3_secret (TYPE S3, KEY_ID '%s', SECRET '%s', REGION '%s', ENDPOINT '%s', USE_SSL false);",
+                    s3KeyId,
+                    s3Secret,
+                    s3Region,
+                    s3Endpoint);
+        } else {
+            secretSql = String.format(
+                    Locale.getDefault(),
+                    "CREATE SECRET IF NOT EXISTS s3_secret (TYPE S3, KEY_ID '%s', SECRET '%s', REGION '%s');",
+                    s3KeyId,
+                    s3Secret,
+                    s3Region);
+        }
+        executeSql(conn, secretSql);
+
+        if (isDuckLake) {
+            // Install and load PostgreSQL scanner extension
+            try {
+                executeSql(conn, "INSTALL postgres_scanner; LOAD postgres_scanner;");
+            } catch (SQLException e) {
+                LOG.warn("Failed to load postgres_scanner, trying postgres", e);
+                executeSql(conn, "INSTALL postgres; LOAD postgres;");
             }
-            stmt.execute(secretSql);
 
-            if (isDuckLake) {
-                // Install and load PostgreSQL scanner extension
-                try {
-                    stmt.execute("INSTALL postgres_scanner; LOAD postgres_scanner;");
-                } catch (SQLException e) {
-                    LOG.warn("Failed to load postgres_scanner, trying postgres", e);
-                    stmt.execute("INSTALL postgres; LOAD postgres;");
-                }
+            // Install and load DuckLake extension
+            try {
+                executeSql(conn, "INSTALL ducklake; LOAD ducklake;");
+            } catch (SQLException e) {
+                LOG.warn("Failed to INSTALL/LOAD ducklake, trying core_nightly", e);
+                executeSql(conn, "FORCE INSTALL ducklake FROM core_nightly; LOAD ducklake;");
+            }
 
-                // Install and load DuckLake extension
-                try {
-                    stmt.execute("INSTALL ducklake; LOAD ducklake;");
-                } catch (SQLException e) {
-                    LOG.warn("Failed to INSTALL/LOAD ducklake, trying core_nightly", e);
-                    try {
-                        stmt.execute("FORCE INSTALL ducklake FROM core_nightly; LOAD ducklake;");
-                    } catch (SQLException e2) {
-                        if (ducklakeExtensionPath != null && !ducklakeExtensionPath.isEmpty()) {
-                            stmt.execute(String.format("LOAD '%s';", ducklakeExtensionPath));
-                        } else {
-                            throw e2;
-                        }
-                    }
-                }
+            // Attach DuckLake catalog backed by PostgreSQL metadata and S3 data path
+            // (DATA_INLINING_ROW_LIMIT 0 disables data inlining, creating Parquet files in S3)
+            StringBuilder connParams = new StringBuilder();
+            connParams.append(String.format("dbname=%s host=%s port=%s user=%s", pgDbName, pgHost, pgPort, pgUser));
+            if (pgPassword != null && !pgPassword.isEmpty()) {
+                connParams.append(" password=").append(pgPassword);
+            }
 
-                // Disable data inlining globally in DuckLake so each insert creates a new file in S3
-                stmt.execute("SET ducklake_default_data_inlining_row_limit = 0;");
+            String attachSql = String.format(
+                    Locale.getDefault(),
+                    "ATTACH 'ducklake:postgres:%s' AS ducklake (DATA_PATH '%s', DATA_INLINING_ROW_LIMIT 0);",
+                    connParams.toString(),
+                    ducklakeDataPath);
+            executeSql(conn, attachSql);
 
-                // Attach DuckLake catalog backed by PostgreSQL metadata and S3 data path
-                StringBuilder connParams = new StringBuilder();
-                connParams.append(String.format("dbname=%s host=%s port=%s user=%s", pgDbName, pgHost, pgPort, pgUser));
-                if (pgPassword != null && !pgPassword.isEmpty()) {
-                    connParams.append(" password=").append(pgPassword);
-                }
+            try {
+                executeSql(conn, "CALL ducklake.set_option('data_inlining_row_limit', 0);");
+            } catch (SQLException e) {
+                LOG.debug("Setting option via CALL ducklake.set_option was not needed or not supported", e);
+            }
 
-                String attachSql = String.format(
-                        Locale.getDefault(),
-                        "ATTACH 'ducklake:postgres:%s' AS ducklake (DATA_PATH '%s', DATA_INLINING_ROW_LIMIT 0);",
-                        connParams.toString(),
-                        ducklakeDataPath);
-                stmt.execute(attachSql);
-
-                try {
-                    stmt.execute("CALL ducklake.set_option('data_inlining_row_limit', 0);");
-                } catch (SQLException e) {
-                    LOG.debug("Setting option via CALL ducklake.set_option was not needed or not supported", e);
-                }
-
-                try {
-                    stmt.execute("USE ducklake;");
-                } catch (SQLException e) {
-                    LOG.debug("Setting default schema to ducklake failed", e);
-                }
+            try {
+                executeSql(conn, "USE ducklake;");
+            } catch (SQLException e) {
+                LOG.debug("Setting default schema to ducklake failed", e);
             }
         }
         return conn;
@@ -601,26 +638,11 @@ public class MultiTableTxn4 {
                 tableNames.add(tableName + tableNum);
             }
 
-            // Start txn on Raven
-            CatalogOuterClass.StartTransactionResponse ravenTxn = ravenCatalog.startTransaction(
-                    workspaceName, dbName, tableNames);
-
-            long txnId = ravenTxn.getTxnId();
-            List<TableObject> unsortedTableObjects = ravenTxn.getTablesList();
-
-            List<TableObject> tableObjects = Lists.newArrayList();
-            for (String name : tableNames) {
-                Optional<TableObject> tableObject = unsortedTableObjects.stream()
-                        .filter(t -> t.getTableName().equals(name))
-                        .findFirst();
-                tableObjects.add(tableObject.get());
-            }
-
             List<String> filePaths = Lists.newArrayList();
             String targetList = schemaToTargetList(schema);
 
+            // Generate data and write Parquet files to S3 once using DuckDB
             for (int j = 0; j < tableNumList.size(); j++) {
-                // Generate data and write Parquet file to S3
                 stmt.execute(
                         String.format(
                                 Locale.getDefault(),
@@ -646,19 +668,63 @@ public class MultiTableTxn4 {
                 filePaths.add(filePath);
             }
 
-            for (int j = 0; j < tableObjects.size(); j++) {
-                // Append files to Raven Catalog
-                List<FileObject> newDataFiles = Lists.newArrayList();
-                FileObject newFileObject = FileObject.newBuilder()
-                        .setTag("newdata")
-                        .setPath(filePaths.get(j))
-                        .build();
-                newDataFiles.add(newFileObject);
+            boolean success = false;
+            double currentWaitMs = startBackoffMs;
 
-                ravenCatalog.finalAppendFiles(tableObjects.get(j), newDataFiles, txnId);
+            // Commit retry loop: if commit returns false, instantiate a new ravenTxn and re-append file metadata
+            for (int attempt = 0; attempt <= numRetries; attempt++) {
+                if (attempt > 0) {
+                    // Exponential backoff with slight jitter (+/- 10%)
+                    double jitter = ThreadLocalRandom.current().nextDouble(0.9, 1.1);
+                    long sleepMs = Math.max(1L, (long) (currentWaitMs * jitter));
+                    try {
+                        TimeUnit.MILLISECONDS.sleep(sleepMs);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                    currentWaitMs *= backoffMultiplier;
+                }
+
+                try {
+                    // Start a new transaction on Raven
+                    CatalogOuterClass.StartTransactionResponse ravenTxn = ravenCatalog.startTransaction(
+                            workspaceName, dbName, tableNames);
+
+                    long txnId = ravenTxn.getTxnId();
+                    List<TableObject> unsortedTableObjects = ravenTxn.getTablesList();
+
+                    List<TableObject> tableObjects = Lists.newArrayList();
+                    for (String name : tableNames) {
+                        Optional<TableObject> tableObject = unsortedTableObjects.stream()
+                                .filter(t -> t.getTableName().equals(name))
+                                .findFirst();
+                        tableObjects.add(tableObject.get());
+                    }
+
+                    // Append metadata of the already created files to the tables in this new transaction
+                    for (int j = 0; j < tableObjects.size(); j++) {
+                        List<FileObject> newDataFiles = Lists.newArrayList();
+                        FileObject newFileObject = FileObject.newBuilder()
+                                .setTag("newdata")
+                                .setPath(filePaths.get(j))
+                                .build();
+                        newDataFiles.add(newFileObject);
+
+                        ravenCatalog.finalAppendFiles(tableObjects.get(j), newDataFiles, txnId);
+                    }
+
+                    success = ravenCatalog.commit(txnId);
+                    if (success) {
+                        break;
+                    } else {
+                        LOG.debug("Raven commit attempt {} returned false, retrying...", attempt + 1);
+                    }
+                } catch (Exception ex) {
+                    LOG.warn("Raven commit attempt failed during retry", ex);
+                    success = false;
+                }
             }
-
-            boolean success = ravenCatalog.commit(txnId);
 
             if (!success) {
                 deleteFiles(filePaths);
