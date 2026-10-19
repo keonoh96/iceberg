@@ -42,13 +42,20 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
 import java.util.UUID;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.iceberg.AppendFiles;
@@ -109,6 +116,9 @@ public class MetadataFootprint {
     private static int numColumns = 10;
     private static int numMeasures = 100;
     private static int logInterval = 10000;
+    private static int batchSize = 100;
+    private static int numThreads = 16;
+    private static int ducklakeMaxRetryCount = 100;
     private static final String FIRST_COL_NAME = "col1";
 
     private static String workspaceName;
@@ -136,6 +146,18 @@ public class MetadataFootprint {
     private static String hmsUri;
     private static HiveCatalog2 catalog2;
     private static RavenCatalog ravenCatalog;
+
+    public static class GeneratedFile {
+        public final int fileIdx;
+        public final String filePath;
+        public final long fileSize;
+
+        public GeneratedFile(int fileIdx, String filePath, long fileSize) {
+            this.fileIdx = fileIdx;
+            this.filePath = filePath;
+            this.fileSize = fileSize;
+        }
+    }
 
     public static class ReadMeasurement {
         public final int iteration;
@@ -223,6 +245,33 @@ public class MetadataFootprint {
             logInterval = Math.max(1, numFiles / 10);
         } else {
             logInterval = 10000;
+        }
+
+        // Batch size for bulk commit (default: 100)
+        String batchSizeStr = expConfigs.getOrDefault("batch_size",
+                expConfigs.getOrDefault("files_per_commit", expConfigs.get("commit_batch_size")));
+        if (batchSizeStr != null && !batchSizeStr.isEmpty() && !batchSizeStr.equalsIgnoreCase("default")) {
+            batchSize = Integer.parseInt(batchSizeStr);
+        } else {
+            batchSize = 100;
+        }
+
+        // Parallel threads for file generation and DuckLake commit (default: 16)
+        String numThreadsStr = expConfigs.getOrDefault("num_threads",
+                expConfigs.getOrDefault("num_populators", expConfigs.get("parallelism")));
+        if (numThreadsStr != null && !numThreadsStr.isEmpty() && !numThreadsStr.equalsIgnoreCase("default")) {
+            numThreads = Integer.parseInt(numThreadsStr);
+        } else {
+            numThreads = 16;
+        }
+
+        // DuckLake max retry count (default: 100)
+        String maxRetryStr = expConfigs.getOrDefault("ducklake_max_retry_count",
+                expConfigs.getOrDefault("max_retry_count", expConfigs.get("num_retries")));
+        if (maxRetryStr != null && !maxRetryStr.isEmpty() && !maxRetryStr.equalsIgnoreCase("default")) {
+            ducklakeMaxRetryCount = Integer.parseInt(maxRetryStr);
+        } else {
+            ducklakeMaxRetryCount = 100;
         }
 
         workspaceName = expConfigs.getOrDefault("workspace_name", "public");
@@ -348,6 +397,14 @@ public class MetadataFootprint {
                 executeSql(conn, "FORCE INSTALL ducklake FROM core_nightly; LOAD ducklake;");
             }
 
+            try {
+                executeSql(conn, "SET ducklake_max_retry_count = " + ducklakeMaxRetryCount + ";");
+                executeSql(conn, "SET ducklake_retry_wait_ms = 20;");
+                executeSql(conn, "SET ducklake_retry_backoff = 1.2;");
+            } catch (SQLException e) {
+                LOG.debug("Setting ducklake retry parameters was not supported", e);
+            }
+
             StringBuilder connParams = new StringBuilder();
             connParams.append(String.format("dbname=%s host=%s port=%s user=%s", pgDatabase, pgHost, pgPort, pgUser));
             if (pgPassword != null && !pgPassword.isEmpty()) {
@@ -423,42 +480,182 @@ public class MetadataFootprint {
         }
     }
 
-    private static void runDuckLake(DuckDBConnection conn, String targetList) throws SQLException {
-        LOG.info("Starting DuckLake footprint insertion: {} files, {} columns, table '{}'...",
+    /**
+     * Generates all numFiles Parquet files in parallel in S3 using DuckDB, returning the in-memory list of file paths.
+     */
+    private static List<GeneratedFile> generateFilesParallel(String targetList, String location)
+            throws InterruptedException, ExecutionException {
+        LOG.info("Phase 1: Generating {} Parquet files in parallel using {} worker threads...",
+                numFiles, numThreads);
+
+        ExecutorService pool = Executors.newFixedThreadPool(numThreads);
+        List<GeneratedFile> allFiles = Collections.synchronizedList(Lists.newArrayListWithCapacity(numFiles));
+        AtomicInteger completed = new AtomicInteger(0);
+        long startGen = System.currentTimeMillis();
+
+        int filesPerThread = (numFiles + numThreads - 1) / numThreads;
+        List<Future<?>> futures = Lists.newArrayList();
+
+        for (int t = 0; t < numThreads; t++) {
+            final int startIdx = t * filesPerThread;
+            final int endIdx = Math.min(startIdx + filesPerThread, numFiles);
+            if (startIdx >= endIdx) {
+                continue;
+            }
+
+            futures.add(pool.submit(() -> {
+                try (Connection conn = DriverManager.getConnection("jdbc:duckdb:");
+                     Statement stmt = conn.createStatement()) {
+                    stmt.execute("INSTALL httpfs; LOAD httpfs;");
+                    stmt.execute("INSTALL parquet; LOAD parquet;");
+
+                    String secretSql;
+                    if (s3Endpoint != null && !s3Endpoint.isEmpty()) {
+                        secretSql = String.format(
+                                Locale.getDefault(),
+                                "CREATE SECRET IF NOT EXISTS s3_secret (TYPE S3, KEY_ID '%s', SECRET '%s', REGION '%s', ENDPOINT '%s', USE_SSL false);",
+                                s3KeyId,
+                                s3Secret,
+                                s3Region,
+                                s3Endpoint);
+                    } else {
+                        secretSql = String.format(
+                                Locale.getDefault(),
+                                "CREATE SECRET IF NOT EXISTS s3_secret (TYPE S3, KEY_ID '%s', SECRET '%s', REGION '%s');",
+                                s3KeyId,
+                                s3Secret,
+                                s3Region);
+                    }
+                    stmt.execute(secretSql);
+
+                    for (int i = startIdx; i < endIdx; i++) {
+                        int batchIdx = i / batchSize;
+                        String filePath = String.format(Locale.getDefault(), "%s/batch_%d/%s.parquet", location, batchIdx, UUID.randomUUID());
+                        String copySql = String.format(
+                                Locale.getDefault(),
+                                "COPY (SELECT %s FROM generate_series(%d, %d) AS t(x)) TO '%s' (FORMAT PARQUET);",
+                                targetList,
+                                i + 1,
+                                i + 1,
+                                filePath);
+                        stmt.execute(copySql);
+
+                        long size = 0L;
+                        if (!isDuckLake) {
+                            size = getFileSize(filePath);
+                        }
+                        allFiles.add(new GeneratedFile(i, filePath, size));
+
+                        int done = completed.incrementAndGet();
+                        if (done % logInterval == 0 || done == numFiles) {
+                            double elapsed = (System.currentTimeMillis() - startGen) / 1000.0;
+                            double rate = (double) done / (elapsed > 0 ? elapsed : 1.0);
+                            double eta = rate > 0 ? (double) (numFiles - done) / rate : 0;
+                            LOG.info("  [Phase 1] Generated {}/{} files ({:.1f}%) | Rate: {:.1f} files/s | Elapsed: {:.1f}s | ETA: {:.1f}s",
+                                    done, numFiles, ((done * 100.0) / numFiles), rate, elapsed, eta);
+                        }
+                    }
+                } catch (SQLException e) {
+                    LOG.error("SQLException during parallel file generation", e);
+                    throw new RuntimeException(e);
+                }
+            }));
+        }
+
+        pool.shutdown();
+        for (Future<?> f : futures) {
+            f.get();
+        }
+
+        long genElapsed = System.currentTimeMillis() - startGen;
+        LOG.info("Phase 1 complete: generated {} files in S3 in {:.2f}s ({:.1f} files/s).",
+                allFiles.size(), genElapsed / 1000.0, (double) allFiles.size() / (genElapsed / 1000.0 > 0 ? genElapsed / 1000.0 : 1.0));
+
+        allFiles.sort(Comparator.comparingInt(f -> f.fileIdx));
+        return allFiles;
+    }
+
+    private static void runDuckLake(DuckDBConnection conn, String targetList)
+            throws ExecutionException, InterruptedException, SQLException {
+        LOG.info("Starting DuckLake population: {} files, {} columns, table '{}'...",
                 numFiles, numColumns, tableName);
         createDuckLakeTable(conn);
 
-        long startTime = System.currentTimeMillis();
-        try (Statement stmt = conn.createStatement()) {
-            for (int i = 0; i < numFiles; i++) {
-                String insertSql = String.format(
-                        Locale.getDefault(),
-                        "INSERT INTO ducklake.%s SELECT %s FROM generate_series(%d, %d) AS t(x);",
-                        tableName,
-                        targetList,
-                        i + 1,
-                        i + 1);
-                stmt.execute(insertSql);
+        String location = String.format(Locale.getDefault(), "%s/%s.db/%s", warehouseLocation, dbName, tableName);
+        List<GeneratedFile> allFiles = generateFilesParallel(targetList, location);
 
-                if ((i + 1) % logInterval == 0 || i + 1 == numFiles) {
-                    double elapsed = (System.currentTimeMillis() - startTime) / 1000.0;
-                    double rate = (i + 1) / (elapsed > 0 ? elapsed : 1.0);
-                    double eta = rate > 0 ? (numFiles - (i + 1)) / rate : 0;
-                    LOG.info("  -> Inserted {}/{} files ({:.1f}%) | Rate: {:.1f} files/s | Elapsed: {:.1f}s | ETA: {:.1f}s",
-                            i + 1, numFiles, ((i + 1) * 100.0) / numFiles, rate, elapsed, eta);
+        int totalBatches = (allFiles.size() + batchSize - 1) / batchSize;
+        LOG.info("Phase 2: Starting parallel bulk commits to DuckLake using {} worker threads ({} files per batch, expecting {} snapshots)...",
+                numThreads, batchSize, totalBatches);
+
+        long startCommit = System.currentTimeMillis();
+        ExecutorService commitPool = Executors.newFixedThreadPool(numThreads);
+        AtomicInteger nextBatch = new AtomicInteger(0);
+        AtomicInteger completedBatches = new AtomicInteger(0);
+        List<Future<?>> commitFutures = Lists.newArrayList();
+
+        for (int t = 0; t < numThreads; t++) {
+            commitFutures.add(commitPool.submit(() -> {
+                try (DuckDBConnection workerConn = initDuckDB()) {
+                    int b;
+                    while ((b = nextBatch.getAndIncrement()) < totalBatches) {
+                        String batchGlob = String.format(Locale.getDefault(), "%s/batch_%d/*.parquet", location, b);
+                        String addSql = String.format(
+                                Locale.getDefault(),
+                                "CALL ducklake_add_data_files('ducklake', '%s', '%s');",
+                                tableName,
+                                batchGlob);
+
+                        boolean ok = false;
+                        for (int attempt = 0; attempt < 5; attempt++) {
+                            try {
+                                executeSql(workerConn, addSql);
+                                ok = true;
+                                break;
+                            } catch (SQLException e) {
+                                if (attempt == 4) {
+                                    LOG.error("Failed to add files for batch {} after retries", b, e);
+                                    throw e;
+                                }
+                                try {
+                                    Thread.sleep(50L + ThreadLocalRandom.current().nextInt(50));
+                                } catch (InterruptedException ie) {
+                                    Thread.currentThread().interrupt();
+                                    throw new RuntimeException(ie);
+                                }
+                            }
+                        }
+
+                        int done = completedBatches.incrementAndGet();
+                        if (done % Math.max(1, totalBatches / 10) == 0 || done == totalBatches) {
+                            double elapsed = (System.currentTimeMillis() - startCommit) / 1000.0;
+                            int filesDoneSoFar = Math.min(done * batchSize, allFiles.size());
+                            double rate = (double) filesDoneSoFar / (elapsed > 0 ? elapsed : 1.0);
+                            LOG.info("  [Phase 2] Committed {}/{} snapshots ({}/{} files) | Rate: {:.1f} files/s | Elapsed: {:.1f}s",
+                                    done, totalBatches, filesDoneSoFar, allFiles.size(), rate, elapsed);
+                        }
+                    }
+                } catch (Exception e) {
+                    LOG.error("Exception in DuckLake commit worker", e);
+                    throw new RuntimeException(e);
                 }
-            }
+            }));
         }
-        LOG.info("DuckLake insertion completed successfully.");
+
+        commitPool.shutdown();
+        for (Future<?> f : commitFutures) {
+            f.get();
+        }
+
+        LOG.info("DuckLake bulk commit completed successfully in {:.2f}s.", (System.currentTimeMillis() - startCommit) / 1000.0);
     }
 
     private static void runRaven(
-            DuckDBConnection duckDbConn,
             TableIdentifier tableIdent,
             Schema schema,
             PartitionSpec spec,
-            String targetList) throws SQLException {
-        LOG.info("Starting Raven footprint insertion: {} files, {} columns, table '{}.{}'...",
+            String targetList) throws ExecutionException, InterruptedException {
+        LOG.info("Starting Raven population: {} files, {} columns, table '{}.{}'...",
                 numFiles, numColumns, dbName, tableName);
 
         initRavenCatalog();
@@ -475,89 +672,81 @@ public class MetadataFootprint {
         }
 
         ravenCatalog = new RavenCatalog(ravenAddress);
+        Table table = catalog2.loadTable(tableIdent);
 
-        long startTime = System.currentTimeMillis();
+        List<GeneratedFile> allFiles = generateFilesParallel(targetList, location);
 
-        try (Statement stmt = duckDbConn.createStatement()) {
-            for (int i = 0; i < numFiles; i++) {
-                // 1. Start Raven transaction
-                StartTransactionResponse ravenTxn = ravenCatalog.startTransaction(
-                        workspaceName, dbName, Lists.newArrayList(tableName));
-                long txnId = ravenTxn.getTxnId();
-                TableObject tableObject = ravenTxn.getTablesList().get(0);
+        int totalBatches = (allFiles.size() + batchSize - 1) / batchSize;
+        LOG.info("Phase 2: Starting single-threaded bulk commits to Iceberg and Raven ({} files per batch, expecting {} snapshots)...",
+                batchSize, totalBatches);
 
-                // 2. Start Iceberg transaction
-                Table table = catalog2.loadTable(tableIdent);
-                AppendFiles txn = table.newFastAppend();
+        long startCommit = System.currentTimeMillis();
 
-                // 3. Write data file using DuckDB (1 row per file)
-                stmt.execute(
-                        String.format(
-                                Locale.getDefault(),
-                                "CREATE TEMP TABLE staging_data AS SELECT %s FROM generate_series(%d, %d) AS t(x);",
-                                targetList,
-                                i + 1,
-                                i + 1));
+        for (int b = 0; b < totalBatches; b++) {
+            int start = b * batchSize;
+            int end = Math.min(start + batchSize, allFiles.size());
+            List<GeneratedFile> batch = allFiles.subList(start, end);
 
-                String filePath = String.format("%s/%s.parquet", table.location(), UUID.randomUUID());
-                stmt.execute(
-                        String.format(
-                                Locale.getDefault(), "COPY staging_data TO '%s' (FORMAT PARQUET);", filePath));
-                stmt.execute("DROP TABLE staging_data;");
+            // 1. Start Raven transaction
+            StartTransactionResponse ravenTxn = ravenCatalog.startTransaction(
+                    workspaceName, dbName, Lists.newArrayList(tableName));
+            long txnId = ravenTxn.getTxnId();
+            TableObject tableObject = ravenTxn.getTablesList().get(0);
 
-                long fileSize = getFileSize(filePath);
+            // 2. Start Iceberg transaction
+            table = catalog2.loadTable(tableIdent);
+            AppendFiles txn = table.newFastAppend();
 
-                // 4. Construct file metrics and commit to Iceberg
-                Metrics metrics = computeStats(schema, i);
+            List<File2> fileLogs = Lists.newArrayList();
+            for (GeneratedFile gf : batch) {
+                Metrics metrics = computeStats(schema, gf.fileIdx);
                 DataFile newFile = DataFiles.builder(spec)
-                        .withFileSizeInBytes(fileSize)
+                        .withFileSizeInBytes(gf.fileSize)
                         .withFormat(FileFormat.PARQUET)
                         .withMetrics(metrics)
-                        .withPath(filePath)
+                        .withPath(gf.filePath)
                         .build();
 
                 txn.appendFile(newFile);
+                fileLogs.add(new File2(gf.filePath, File2.File2Type.ADD, "data"));
+            }
 
-                List<File2> fileLogs = Lists.newArrayList();
-                fileLogs.add(new File2(filePath, File2.File2Type.ADD, "data"));
+            // Commit to Iceberg
+            txn.commit2(fileLogs);
 
-                txn.commit2(fileLogs);
+            // Commit to Raven (including data and new metadata files)
+            List<FileObject> newDataFiles = Lists.newArrayList();
+            List<String> filesToReplace = Lists.newArrayList();
 
-                // 5. Commit to Raven (including the new data and metadata files)
-                List<FileObject> newDataFiles = Lists.newArrayList();
-                List<String> filesToReplace = Lists.newArrayList();
-
-                for (File2 file : fileLogs) {
-                    switch (file.fileType()) {
-                        case ADD:
-                            FileObject newMetadataFileObject = FileObject.newBuilder()
-                                    .setTag(file.tag()).setPath(file.path()).build();
-                            newDataFiles.add(newMetadataFileObject);
-                            break;
-                        case DELETE:
-                            filesToReplace.add(file.path());
-                            break;
-                        default:
-                            break;
-                    }
-                }
-
-                ravenCatalog.finalRewriteFiles(tableObject, filesToReplace, newDataFiles, txnId);
-                boolean success = ravenCatalog.commit(txnId);
-                if (!success) {
-                    LOG.warn("Raven transaction commit returned false for fileIdx {}", i);
-                }
-
-                if ((i + 1) % logInterval == 0 || i + 1 == numFiles) {
-                    double elapsed = (System.currentTimeMillis() - startTime) / 1000.0;
-                    double rate = (i + 1) / (elapsed > 0 ? elapsed : 1.0);
-                    double eta = rate > 0 ? (numFiles - (i + 1)) / rate : 0;
-                    LOG.info("  -> Inserted {}/{} files ({:.1f}%) | Rate: {:.1f} files/s | Elapsed: {:.1f}s | ETA: {:.1f}s",
-                            i + 1, numFiles, ((i + 1) * 100.0) / numFiles, rate, elapsed, eta);
+            for (File2 file : fileLogs) {
+                switch (file.fileType()) {
+                    case ADD:
+                        FileObject newMetadataFileObject = FileObject.newBuilder()
+                                .setTag(file.tag()).setPath(file.path()).build();
+                        newDataFiles.add(newMetadataFileObject);
+                        break;
+                    case DELETE:
+                        filesToReplace.add(file.path());
+                        break;
+                    default:
+                        break;
                 }
             }
+
+            ravenCatalog.finalRewriteFiles(tableObject, filesToReplace, newDataFiles, txnId);
+            boolean success = ravenCatalog.commit(txnId);
+            if (!success) {
+                LOG.warn("Raven transaction commit returned false for batch {}", b + 1);
+            }
+
+            if ((b + 1) % Math.max(1, totalBatches / 10) == 0 || b + 1 == totalBatches) {
+                double elapsed = (System.currentTimeMillis() - startCommit) / 1000.0;
+                double rate = (double) end / (elapsed > 0 ? elapsed : 1.0);
+                LOG.info("  [Phase 2] Committed {}/{} snapshots ({}/{} files) | Rate: {:.1f} files/s | Elapsed: {:.1f}s",
+                        b + 1, totalBatches, end, allFiles.size(), rate, elapsed);
+            }
         }
-        LOG.info("Raven insertion completed successfully.");
+        LOG.info("Raven bulk commit completed successfully in {:.2f}s.", (System.currentTimeMillis() - startCommit) / 1000.0);
     }
 
     private static long getFileSize(String path) {
@@ -652,6 +841,9 @@ public class MetadataFootprint {
         resultNode.put("catalog_type", catalogType);
         resultNode.put("num_files", numFiles);
         resultNode.put("num_columns", numColumns);
+        resultNode.put("batch_size", batchSize);
+        resultNode.put("num_snapshots", (numFiles + batchSize - 1) / batchSize);
+        resultNode.put("num_threads", numThreads);
         resultNode.put("pg_database", pgDatabase);
         resultNode.put("pg_host", pgHost);
         resultNode.put("pg_port", pgPort);
@@ -782,7 +974,7 @@ public class MetadataFootprint {
                 if (isDuckLake) {
                     runDuckLake(duckDbConn, targetList);
                 } else {
-                    runRaven(duckDbConn, tableIdent, schema, spec, targetList);
+                    runRaven(tableIdent, schema, spec, targetList);
                 }
 
                 long elapsedMs = System.currentTimeMillis() - startTimeMs;
