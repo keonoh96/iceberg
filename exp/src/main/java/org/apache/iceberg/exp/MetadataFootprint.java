@@ -118,6 +118,8 @@ public class MetadataFootprint {
     private static int logInterval = 10000;
     private static int batchSize = 100;
     private static int numThreads = 16;
+    private static int numFileGenThreads = 16;
+    private static int numDuckDBInsertThreads = 16;
     private static int ducklakeMaxRetryCount = 100;
     private static final String FIRST_COL_NAME = "col1";
 
@@ -256,13 +258,34 @@ public class MetadataFootprint {
             batchSize = 100;
         }
 
-        // Parallel threads for file generation and DuckLake commit (default: 16)
+        // Parallel threads: num_threads serves as the default for both file generation and DuckDB insert
         String numThreadsStr = expConfigs.getOrDefault("num_threads",
                 expConfigs.getOrDefault("num_populators", expConfigs.get("parallelism")));
         if (numThreadsStr != null && !numThreadsStr.isEmpty() && !numThreadsStr.equalsIgnoreCase("default")) {
             numThreads = Integer.parseInt(numThreadsStr);
         } else {
             numThreads = 16;
+        }
+
+        // Thread pool size for data file generation (Phase 1): defaults to num_threads
+        String fileGenThreadsStr = expConfigs.getOrDefault("num_file_gen_threads",
+                expConfigs.getOrDefault("num_gen_threads", expConfigs.get("file_gen_threads")));
+        if (fileGenThreadsStr != null && !fileGenThreadsStr.isEmpty() && !fileGenThreadsStr.equalsIgnoreCase("default")) {
+            numFileGenThreads = Integer.parseInt(fileGenThreadsStr);
+        } else {
+            numFileGenThreads = numThreads;
+        }
+
+        // Thread pool size for DuckDB insert / commit (Phase 2): defaults to num_threads, overridable by another parameter
+        String duckDbInsertThreadsStr = expConfigs.getOrDefault("num_commit_threads",
+                expConfigs.getOrDefault("num_insert_threads",
+                expConfigs.getOrDefault("num_duckdb_threads",
+                expConfigs.getOrDefault("insert_threads",
+                expConfigs.getOrDefault("commit_threads", expConfigs.get("duckdb_threads"))))));
+        if (duckDbInsertThreadsStr != null && !duckDbInsertThreadsStr.isEmpty() && !duckDbInsertThreadsStr.equalsIgnoreCase("default")) {
+            numDuckDBInsertThreads = Integer.parseInt(duckDbInsertThreadsStr);
+        } else {
+            numDuckDBInsertThreads = numThreads;
         }
 
         // DuckLake max retry count (default: 100)
@@ -486,24 +509,24 @@ public class MetadataFootprint {
     private static List<GeneratedFile> generateFilesParallel(String targetList, String location)
             throws InterruptedException, ExecutionException {
         LOG.info("Phase 1: Generating {} Parquet files in parallel using {} worker threads...",
-                numFiles, numThreads);
+                numFiles, numFileGenThreads);
 
-        ExecutorService pool = Executors.newFixedThreadPool(numThreads);
+        ExecutorService fileGenPool = Executors.newFixedThreadPool(numFileGenThreads);
         List<GeneratedFile> allFiles = Collections.synchronizedList(Lists.newArrayListWithCapacity(numFiles));
         AtomicInteger completed = new AtomicInteger(0);
         long startGen = System.currentTimeMillis();
 
-        int filesPerThread = (numFiles + numThreads - 1) / numThreads;
+        int filesPerThread = (numFiles + numFileGenThreads - 1) / numFileGenThreads;
         List<Future<?>> futures = Lists.newArrayList();
 
-        for (int t = 0; t < numThreads; t++) {
+        for (int t = 0; t < numFileGenThreads; t++) {
             final int startIdx = t * filesPerThread;
             final int endIdx = Math.min(startIdx + filesPerThread, numFiles);
             if (startIdx >= endIdx) {
                 continue;
             }
 
-            futures.add(pool.submit(() -> {
+            futures.add(fileGenPool.submit(() -> {
                 try (Connection conn = DriverManager.getConnection("jdbc:duckdb:");
                      Statement stmt = conn.createStatement()) {
                     stmt.execute("INSTALL httpfs; LOAD httpfs;");
@@ -562,7 +585,7 @@ public class MetadataFootprint {
             }));
         }
 
-        pool.shutdown();
+        fileGenPool.shutdown();
         for (Future<?> f : futures) {
             f.get();
         }
@@ -586,15 +609,15 @@ public class MetadataFootprint {
 
         int totalBatches = (allFiles.size() + batchSize - 1) / batchSize;
         LOG.info("Phase 2: Starting parallel bulk commits to DuckLake using {} worker threads ({} files per batch, expecting {} snapshots)...",
-                numThreads, batchSize, totalBatches);
+                numDuckDBInsertThreads, batchSize, totalBatches);
 
         long startCommit = System.currentTimeMillis();
-        ExecutorService commitPool = Executors.newFixedThreadPool(numThreads);
+        ExecutorService commitPool = Executors.newFixedThreadPool(numDuckDBInsertThreads);
         AtomicInteger nextBatch = new AtomicInteger(0);
         AtomicInteger completedBatches = new AtomicInteger(0);
         List<Future<?>> commitFutures = Lists.newArrayList();
 
-        for (int t = 0; t < numThreads; t++) {
+        for (int t = 0; t < numDuckDBInsertThreads; t++) {
             commitFutures.add(commitPool.submit(() -> {
                 try (DuckDBConnection workerConn = initDuckDB()) {
                     int b;
@@ -844,6 +867,8 @@ public class MetadataFootprint {
         resultNode.put("batch_size", batchSize);
         resultNode.put("num_snapshots", (numFiles + batchSize - 1) / batchSize);
         resultNode.put("num_threads", numThreads);
+        resultNode.put("num_file_gen_threads", numFileGenThreads);
+        resultNode.put("num_insert_threads", numDuckDBInsertThreads);
         resultNode.put("pg_database", pgDatabase);
         resultNode.put("pg_host", pgHost);
         resultNode.put("pg_port", pgPort);
